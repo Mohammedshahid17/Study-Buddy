@@ -37,7 +37,7 @@ export const QuizModal: React.FC<QuizModalProps> = ({
     setSubmitted({});
 
     try {
-      const res = await fetch('/api/quiz/generate', {
+      const res = await fetch('https://study-buddy-qqbe.onrender.com/api/quiz/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ topic, difficulty }),
