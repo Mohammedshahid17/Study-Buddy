@@ -183,7 +183,7 @@ export default function App() {
         },
       ];
 
-      const response = await fetch('/api/chat', {
+      const response = await fetch('https://study-buddy-qqbe.onrender.com/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
