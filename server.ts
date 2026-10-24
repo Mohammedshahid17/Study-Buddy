@@ -1,4 +1,21 @@
 import express from 'express';
+app.use((req, res, next) => {
+  const allowedOrigin = 'https://mohammedshahid17.github.io';
+
+  if (req.headers.origin === allowedOrigin) {
+    res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+  }
+
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.sendStatus(204);
+    return;
+  }
+
+  next();
+});
 import type { Request, Response } from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
