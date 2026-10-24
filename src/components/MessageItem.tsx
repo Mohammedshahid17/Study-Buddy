@@ -167,7 +167,7 @@ export const MessageItem: React.FC<MessageItemProps> = ({
             />
 
             {/* Streaming cursor */}
-            {message.isStreaming && (
+            {message.isStreaming && !message.error && (
               <span className="inline-flex items-center gap-1 text-[#F97316] mt-2 font-mono text-xs animate-pulse">
                 <span className="w-2 h-2 rounded-full bg-[#F97316]" />
                 Thinking...

@@ -1,6 +1,8 @@
-import express, { Request, Response } from 'express';
+import express from 'express';
+import type { Request, Response } from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
 
@@ -10,7 +12,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = parseInt(process.env.PORT || '3000', 10);
+// Cloud Run reverse proxy (nginx) listens on 8080 and proxies all requests to port 3000.
+// Per AI Studio runtime guidelines, the Node server must listen on port 3000.
+const PORT = 3000;
 
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
@@ -64,6 +68,50 @@ app.get('/api/health', (_req: Request, res: Response) => {
   });
 });
 
+// Helper to stream content with model fallback
+async function streamWithModelFallback(
+  contents: any,
+  systemPrompt: string,
+  onChunk: (text: string) => void
+) {
+  // Try ultra-fast gemini-3.1-flash-lite first, fallback to gemini-3.8-flash if needed
+  const models = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+  let lastError: any = null;
+
+  for (const model of models) {
+    try {
+      const responseStream = await ai.models.generateContentStream({
+        model,
+        contents,
+        config: {
+          systemInstruction: systemPrompt,
+          temperature: 0.7,
+          topP: 0.95,
+        },
+      });
+
+      let receivedAny = false;
+      for await (const chunk of responseStream) {
+        const text = chunk.text;
+        if (text) {
+          receivedAny = true;
+          onChunk(text);
+        }
+      }
+
+      if (receivedAny) {
+        return; // Success!
+      }
+    } catch (err: any) {
+      console.warn(`Model ${model} failed with error:`, err?.message || err);
+      lastError = err;
+      // Continue to next model in fallback list
+    }
+  }
+
+  throw lastError || new Error('All models failed to respond.');
+}
+
 // Streaming Chat Endpoint
 app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
   try {
@@ -91,7 +139,6 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
     }
 
     // Format conversation history for Gemini
-    // We transform messages into contents format
     const contents: Array<{
       role: 'user' | 'model';
       parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }>;
@@ -110,7 +157,6 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
       if (Array.isArray(msg.attachments)) {
         for (const att of msg.attachments) {
           if (att.base64 && att.type) {
-            // Remove data URI prefix if present
             const cleanBase64 = att.base64.replace(/^data:[^;]+;base64,/, '');
             parts.push({
               inlineData: {
@@ -132,36 +178,23 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // Set headers for Server-Sent Events (SSE)
-    res.setHeader('Content-Type', 'text/event-stream');
+    // Set headers for Server-Sent Events (SSE) with X-Accel-Buffering: no for NGINX/Cloud Run
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
 
-    const responseStream = await ai.models.generateContentStream({
-      model: 'gemini-3.8-flash',
-      contents: contents,
-      config: {
-        systemInstruction: effectiveSystemPrompt,
-        temperature: 0.7,
-        topP: 0.95,
-      },
+    await streamWithModelFallback(contents, effectiveSystemPrompt, (chunkText) => {
+      res.write(`data: ${JSON.stringify({ chunk: chunkText })}\n\n`);
     });
-
-    for await (const chunk of responseStream) {
-      const text = chunk.text;
-      if (text) {
-        res.write(`data: ${JSON.stringify({ chunk: text })}\n\n`);
-      }
-    }
 
     res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
     res.end();
   } catch (error: any) {
     console.error('Error in /api/chat:', error);
-    // If headers already sent, write SSE error
     if (res.headersSent) {
-      res.write(`data: ${JSON.stringify({ error: error?.message || 'Generation failed' })}\n\n`);
+      res.write(`data: ${JSON.stringify({ error: error?.message || 'Generation failed. Please try again.' })}\n\n`);
       res.end();
     } else {
       res.status(500).json({
@@ -179,41 +212,56 @@ app.post('/api/quiz/generate', async (req: Request, res: Response): Promise<void
     const prompt = `Generate an interactive 3-question diagnostic quiz for a first-year student on the topic "${topic}" at level "${difficulty}".
 Questions must test fundamental understanding, common beginner edge cases, or code reading.`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-      config: {
-        systemInstruction: `You are StudyBuddy 🎓 quiz master. Generate engaging, educational multiple-choice questions with clear explanations and hints.`,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            topic: { type: Type.STRING },
-            questions: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  id: { type: Type.STRING },
-                  question: { type: Type.STRING },
-                  codeSnippet: { type: Type.STRING },
-                  options: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING },
+    const models = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+    let response: any = null;
+    let lastErr: any = null;
+
+    for (const m of models) {
+      try {
+        response = await ai.models.generateContent({
+          model: m,
+          contents: prompt,
+          config: {
+            systemInstruction: `You are StudyBuddy 🎓 quiz master. Generate engaging, educational multiple-choice questions with clear explanations and hints.`,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                topic: { type: Type.STRING },
+                questions: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      id: { type: Type.STRING },
+                      question: { type: Type.STRING },
+                      codeSnippet: { type: Type.STRING },
+                      options: {
+                        type: Type.ARRAY,
+                        items: { type: Type.STRING },
+                      },
+                      correctIndex: { type: Type.INTEGER },
+                      hint: { type: Type.STRING },
+                      explanation: { type: Type.STRING },
+                      analogy: { type: Type.STRING },
+                    },
+                    required: ['id', 'question', 'options', 'correctIndex', 'hint', 'explanation'],
                   },
-                  correctIndex: { type: Type.INTEGER },
-                  hint: { type: Type.STRING },
-                  explanation: { type: Type.STRING },
-                  analogy: { type: Type.STRING },
                 },
-                required: ['id', 'question', 'options', 'correctIndex', 'hint', 'explanation'],
               },
+              required: ['topic', 'questions'],
             },
           },
-          required: ['topic', 'questions'],
-        },
-      },
-    });
+        });
+        if (response?.text) break;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+
+    if (!response?.text) {
+      throw lastErr || new Error('Quiz could not be generated.');
+    }
 
     const parsed = JSON.parse(response.text || '{}');
     res.json(parsed);
@@ -234,43 +282,58 @@ app.post('/api/explain-code', async (req: Request, res: Response): Promise<void>
 
     const prompt = `Analyze this ${language} code snippet line-by-line for a first-year CS student:\n\`\`\`${language}\n${code}\n\`\`\``;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-      config: {
-        systemInstruction: `You are StudyBuddy 🎓. Provide a visual, mental-model breakdown of the provided code snippet.
+    const models = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+    let response: any = null;
+    let lastErr: any = null;
+
+    for (const m of models) {
+      try {
+        response = await ai.models.generateContent({
+          model: m,
+          contents: prompt,
+          config: {
+            systemInstruction: `You are StudyBuddy 🎓. Provide a visual, mental-model breakdown of the provided code snippet.
 Highlight what memory or variables look like at each step, any subtle pitfalls for beginners, and a simple real-world analogy.`,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            title: { type: Type.STRING },
-            overview: { type: Type.STRING },
-            analogy: { type: Type.STRING },
-            timeComplexity: { type: Type.STRING },
-            spaceComplexity: { type: Type.STRING },
-            steps: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  lineNumber: { type: Type.INTEGER },
-                  codeLine: { type: Type.STRING },
-                  action: { type: Type.STRING },
-                  variableState: { type: Type.STRING },
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                title: { type: Type.STRING },
+                overview: { type: Type.STRING },
+                analogy: { type: Type.STRING },
+                timeComplexity: { type: Type.STRING },
+                spaceComplexity: { type: Type.STRING },
+                steps: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      lineNumber: { type: Type.INTEGER },
+                      codeLine: { type: Type.STRING },
+                      action: { type: Type.STRING },
+                      variableState: { type: Type.STRING },
+                    },
+                    required: ['lineNumber', 'codeLine', 'action'],
+                  },
                 },
-                required: ['lineNumber', 'codeLine', 'action'],
+                commonPitfalls: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                },
               },
-            },
-            commonPitfalls: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
+              required: ['title', 'overview', 'steps', 'commonPitfalls'],
             },
           },
-          required: ['title', 'overview', 'steps', 'commonPitfalls'],
-        },
-      },
-    });
+        });
+        if (response?.text) break;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+
+    if (!response?.text) {
+      throw lastErr || new Error('Code explanation could not be generated.');
+    }
 
     const parsed = JSON.parse(response.text || '{}');
     res.json(parsed);
@@ -289,7 +352,6 @@ app.post('/api/tts', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // Limit text length to 1000 characters for snappy response
     const sanitizedText = text.slice(0, 1000);
 
     const response = await ai.models.generateContent({
@@ -329,24 +391,26 @@ app.post('/api/tts', async (req: Request, res: Response): Promise<void> => {
   }
 });
 
-// Start Express server and mount Vite middleware in development
+// Start Express server and mount Vite middleware in development or static dist in production
 async function startServer() {
-  const isProd = process.env.NODE_ENV === 'production';
+  const distPath = path.resolve(__dirname, 'dist');
+  const hasDist = fs.existsSync(path.join(distPath, 'index.html'));
+  const isProd = process.env.NODE_ENV === 'production' || hasDist;
 
-  if (!isProd) {
+  if (isProd && hasDist) {
+    console.log(`Serving static production build from ${distPath}`);
+    app.use(express.static(distPath));
+    app.get('*', (_req: Request, res: Response) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  } else {
+    console.log('Mounting Vite dev middleware');
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
-  } else {
-    // Serve static build from dist folder
-    const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req: Request, res: Response) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
   }
 
   app.listen(PORT, '0.0.0.0', () => {
