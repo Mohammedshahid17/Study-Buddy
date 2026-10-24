@@ -1,0 +1,6 @@
+{
+  "name": "StudyBuddy",
+  "description": "AI study companion for first-year students to understand programming concepts, Python & JavaScript basics, and CS fundamentals with interactive examples and step-by-step analogies.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
