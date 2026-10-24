@@ -33,7 +33,7 @@ export const CodeExplainerModal: React.FC<CodeExplainerModalProps> = ({
     setActiveStep(0);
 
     try {
-      const res = await fetch('/api/explain-code', {
+      const res = await fetch('https://study-buddy-qqbe.onrender.com/api/explain-code', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ code, language }),
