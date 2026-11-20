@@ -14,7 +14,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 // Cloud Run reverse proxy (nginx) listens on 8080 and proxies all requests to port 3000.
 // Per AI Studio runtime guidelines, the Node server must listen on port 3000.
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
